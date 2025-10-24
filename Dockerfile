@@ -4,11 +4,13 @@ FROM alpine:latest AS version-fetcher
 # Install dependencies for API calls
 RUN apk add --no-cache curl jq
 
-# Fetch latest versions from GitHub APIs
+# Fetch latest versions from GitHub APIs and create download scripts
 RUN curl -s https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest | \
     jq -r '.tag_name' > /tmp/adguard_version && \
     curl -s https://api.github.com/repos/tailscale/tailscale/releases/latest | \
-    jq -r '.tag_name' | sed 's/^v//' > /tmp/tailscale_version
+    jq -r '.tag_name' | sed 's/^v//' > /tmp/tailscale_version && \
+    echo "AdGuard version: $(cat /tmp/adguard_version)" && \
+    echo "Tailscale version: $(cat /tmp/tailscale_version)"
 
 # AdGuard Home builder stage
 FROM golang:1.21-alpine AS adguard-builder
@@ -25,7 +27,7 @@ WORKDIR /src
 # Clone AdGuard Home source using latest version
 RUN ADGUARD_VERSION=$(cat /tmp/adguard_version) && \
     echo "Building AdGuard Home version: $ADGUARD_VERSION" && \
-    git clone --branch $ADGUARD_VERSION --depth 1 https://github.com/AdguardTeam/AdGuardHome.git .
+    git clone --branch "$ADGUARD_VERSION" --depth 1 https://github.com/AdguardTeam/AdGuardHome.git .
 
 # Build AdGuard Home
 RUN make build-release
@@ -38,18 +40,22 @@ COPY --from=version-fetcher /tmp/tailscale_version /tmp/tailscale_version
 
 ARG TARGETARCH=amd64
 
-# Install dependencies and download latest Tailscale
-RUN apk add --no-cache curl ca-certificates && \
-    TAILSCALE_VERSION=$(cat /tmp/tailscale_version) && \
-    echo "Downloading Tailscale version: $TAILSCALE_VERSION" && \
-    curl -fsSL "https://github.com/tailscale/tailscale/releases/download/v${TAILSCALE_VERSION}/tailscale_${TAILSCALE_VERSION}_linux_${TARGETARCH}.tgz" \
-    -o tailscale.tgz && \
+# Install dependencies
+RUN apk add --no-cache curl ca-certificates
+
+# Download Tailscale using a script to handle variables properly
+RUN TAILSCALE_VERSION=$(cat /tmp/tailscale_version) && \
+    echo "Downloading Tailscale version: $TAILSCALE_VERSION for architecture: $TARGETARCH" && \
+    DOWNLOAD_URL="https://github.com/tailscale/tailscale/releases/download/v$TAILSCALE_VERSION/tailscale_${TAILSCALE_VERSION}_linux_$TARGETARCH.tgz" && \
+    echo "Download URL: $DOWNLOAD_URL" && \
+    curl -fsSL "$DOWNLOAD_URL" -o tailscale.tgz && \
     tar xzf tailscale.tgz --strip-components=1 && \
     chmod +x tailscale tailscaled && \
+    ls -la tailscale tailscaled && \
     rm tailscale.tgz && \
     echo "Tailscale $TAILSCALE_VERSION downloaded successfully"
 
-# Final distroless stage
+# Final distroless stage  
 FROM gcr.io/distroless/static-debian12:nonroot
 
 # Copy version files for reference
@@ -250,7 +256,7 @@ ENV TS_USERSPACE=true \
 LABEL org.opencontainers.image.title="AdGuard Home with Tailscale" \
       org.opencontainers.image.description="Rootless, distroless AdGuard Home with Tailscale integration" \
       org.opencontainers.image.authors="hucknz" \
-      org.opencontainers.image.created="2025-10-24T04:08:56Z" \
+      org.opencontainers.image.created="2025-10-24T04:11:50Z" \
       org.opencontainers.image.source="https://github.com/hucknz/adguard-tailscale"
 
 # Expose ports
