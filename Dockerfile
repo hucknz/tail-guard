@@ -43,26 +43,22 @@ ARG TARGETARCH=amd64
 # Install dependencies
 RUN apk add --no-cache curl ca-certificates
 
-# Create download script to handle variables properly
-RUN cat > /download-tailscale.sh << 'SCRIPT' && \
-#!/bin/sh
-set -e
-TAILSCALE_VERSION=$(cat /tmp/tailscale_version)
-TARGETARCH=${1:-amd64}
-echo "Downloading Tailscale version: $TAILSCALE_VERSION for architecture: $TARGETARCH"
-DOWNLOAD_URL="https://github.com/tailscale/tailscale/releases/download/v${TAILSCALE_VERSION}/tailscale_${TAILSCALE_VERSION}_linux_${TARGETARCH}.tgz"
-echo "Download URL: $DOWNLOAD_URL"
-curl -fsSL "$DOWNLOAD_URL" -o tailscale.tgz
-tar xzf tailscale.tgz --strip-components=1
-chmod +x tailscale tailscaled
-ls -la tailscale tailscaled
-rm tailscale.tgz
-echo "Tailscale $TAILSCALE_VERSION downloaded successfully"
-SCRIPT
-chmod +x /download-tailscale.sh
-
-# Execute the download script
-RUN /download-tailscale.sh $TARGETARCH
+# Create and execute download script
+RUN echo '#!/bin/sh' > /download-tailscale.sh && \
+    echo 'set -e' >> /download-tailscale.sh && \
+    echo 'TAILSCALE_VERSION=$(cat /tmp/tailscale_version)' >> /download-tailscale.sh && \
+    echo 'TARGETARCH=${1:-amd64}' >> /download-tailscale.sh && \
+    echo 'echo "Downloading Tailscale version: $TAILSCALE_VERSION for architecture: $TARGETARCH"' >> /download-tailscale.sh && \
+    echo 'DOWNLOAD_URL="https://github.com/tailscale/tailscale/releases/download/v${TAILSCALE_VERSION}/tailscale_${TAILSCALE_VERSION}_linux_${TARGETARCH}.tgz"' >> /download-tailscale.sh && \
+    echo 'echo "Download URL: $DOWNLOAD_URL"' >> /download-tailscale.sh && \
+    echo 'curl -fsSL "$DOWNLOAD_URL" -o tailscale.tgz' >> /download-tailscale.sh && \
+    echo 'tar xzf tailscale.tgz --strip-components=1' >> /download-tailscale.sh && \
+    echo 'chmod +x tailscale tailscaled' >> /download-tailscale.sh && \
+    echo 'ls -la tailscale tailscaled' >> /download-tailscale.sh && \
+    echo 'rm tailscale.tgz' >> /download-tailscale.sh && \
+    echo 'echo "Tailscale $TAILSCALE_VERSION downloaded successfully"' >> /download-tailscale.sh && \
+    chmod +x /download-tailscale.sh && \
+    /download-tailscale.sh $TARGETARCH
 
 # Final distroless stage  
 FROM gcr.io/distroless/static-debian12:nonroot
@@ -265,7 +261,7 @@ ENV TS_USERSPACE=true \
 LABEL org.opencontainers.image.title="AdGuard Home with Tailscale" \
       org.opencontainers.image.description="Rootless, distroless AdGuard Home with Tailscale integration" \
       org.opencontainers.image.authors="hucknz" \
-      org.opencontainers.image.created="2025-10-24T04:14:04Z" \
+      org.opencontainers.image.created="2025-10-24T04:16:13Z" \
       org.opencontainers.image.source="https://github.com/hucknz/adguard-tailscale"
 
 # Expose ports
