@@ -4,11 +4,13 @@ RUN apt-get update && \
     apt-get install -y curl tar ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
+# Download and extract Tailscale
 RUN TS_VER=$(curl -sL https://pkgs.tailscale.com/stable/index.json | \
     grep -oP '"linux_amd64":\s*"\K[0-9.]+' | sort -V | tail -1) && \
     curl -Lo /tmp/tailscale.tgz "https://pkgs.tailscale.com/stable/tailscale_${TS_VER}_amd64.tgz" && \
     tar -C /tmp -xzf /tmp/tailscale.tgz
 
+# Download and extract AdGuard Home
 RUN AGH_URL=$(curl -s https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest | \
     grep browser_download_url | grep linux_amd64 | grep -v .sig | cut -d '"' -f 4) && \
     curl -Lo /tmp/AdGuardHome.tar.gz "$AGH_URL" && \
@@ -17,7 +19,7 @@ RUN AGH_URL=$(curl -s https://api.github.com/repos/AdguardTeam/AdGuardHome/relea
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-FROM gcr.io/distroless/base-debian12-nonroot
+FROM gcr.io/distroless/base-debian12
 
 ENV TS_STATE_DIR="/var/lib/tailscale" \
     TS_SOCKET="/var/run/tailscale/tailscaled.sock" \
@@ -27,7 +29,8 @@ ENV TS_STATE_DIR="/var/lib/tailscale" \
 USER nonroot:nonroot
 WORKDIR /home/nonroot
 
-COPY --from=builder /tmp/tailscale* /usr/local/bin/
+COPY --from=builder /tmp/tailscale*/tailscaled /usr/local/bin/
+COPY --from=builder /tmp/tailscale*/tailscale /usr/local/bin/
 COPY --from=builder /tmp/AdGuardHome/AdGuardHome /usr/local/bin/AdGuardHome
 COPY --from=builder /entrypoint.sh /entrypoint.sh
 
