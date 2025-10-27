@@ -1,8 +1,14 @@
+# Small distroless image running Tailscale + AdGuardHome
+# - Latest Tailscale via official apt repo (in builder)
+# - Latest AdGuardHome via GitHub "latest/download" with multi-arch support
+# - Distroless final image with a tiny Go entrypoint (no shell)
+
 ############################
 # 1) Build tiny entrypoint #
 ############################
 FROM golang:1.23-bookworm AS entrypoint-builder
 WORKDIR /src
+RUN mkdir -p /out
 # Embed the entrypoint source directly for a single-file setup
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build bash -eu -o pipefail <<'EOF'
 cat > main.go <<'GO'
@@ -48,7 +54,6 @@ func splitArgs(s string) []string {
 	if s == "" {
 		return nil
 	}
-	// Simple whitespace split; quoting is not supported to keep image minimal.
 	return strings.Fields(s)
 }
 
@@ -157,10 +162,7 @@ func main() {
 	// 2) tailscale up (unless already logged in and TS_AUTH_ONCE)
 	alreadyUp := func() bool {
 		cmd := exec.Command("/usr/bin/tailscale", "--socket="+tsSocket, "status", "--peers=false")
-		if err := cmd.Run(); err != nil {
-			return false
-		}
-		return true
+		return cmd.Run() == nil
 	}()
 
 	shouldUp := true
@@ -171,7 +173,6 @@ func main() {
 
 	if shouldUp {
 		upArgs := []string{"--socket=" + tsSocket, "up"}
-		// Keep defaults explicit based on envs
 		upArgs = append(upArgs, fmt.Sprintf("--accept-dns=%v", tsAcceptDNS))
 		if tsUserspace {
 			upArgs = append(upArgs, "--tun=userspace-networking")
@@ -191,14 +192,12 @@ func main() {
 		if tsHTTPProxy != "" {
 			upArgs = append(upArgs, "--outbound-http-proxy-listen="+tsHTTPProxy)
 		}
-		// Execute up
 		cmd := exec.Command("/usr/bin/tailscale", upArgs...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		log.Printf("Running: tailscale %s", strings.Join(upArgs, " "))
 		if err := cmd.Run(); err != nil {
 			log.Printf("[error] tailscale up failed: %v", err)
-			// If no authkey was provided, this might be an interactive login requirement; continue to run anyway.
 		}
 	}
 
@@ -238,9 +237,6 @@ waitLoop:
 			_ = tsd.Process.Signal(sig)
 			_ = agh.Process.Signal(sig)
 		default:
-			// poll children
-			tse := tsd.ProcessState
-			age := agh.ProcessState
 			if tsd.ProcessState != nil && tsd.ProcessState.Exited() {
 				exitErr = errors.New("tailscaled exited")
 				break waitLoop
@@ -249,12 +245,10 @@ waitLoop:
 				exitErr = errors.New("AdGuardHome exited")
 				break waitLoop
 			}
-			// WaitNonblocking not available, sleep a bit
 			time.Sleep(300 * time.Millisecond)
 		}
 	}
 
-	// Final wait to reap
 	_, _ = tsd.Process.Wait()
 	_, _ = agh.Process.Wait()
 
@@ -284,30 +278,37 @@ RUN curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg | t
 #############################
 FROM debian:bookworm-slim AS adgh-builder
 SHELL ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
+ARG TARGETARCH
+ARG TARGETVARIANT
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tar && rm -rf /var/lib/apt/lists/*
-# Resolve architecture to AdGuardHome asset name
-RUN arch="$(dpkg --print-architecture)" \
- && case "$arch" in \
-      amd64) agh_arch=amd64 ;; \
-      arm64) agh_arch=arm64 ;; \
-      *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
-    esac \
- && curl -fsSL "https://github.com/AdguardTeam/AdGuardHome/releases/latest/download/AdGuardHome_linux_${agh_arch}.tar.gz" \
-    | tar -xz -C /tmp \
- && install -m 0755 /tmp/AdGuardHome/AdGuardHome /out/AdGuardHome
+RUN mkdir -p /out
+# Use buildx-provided TARGETARCH/TARGETVARIANT to choose the correct asset
+RUN set -euxo pipefail; \
+  case "$TARGETARCH" in \
+    amd64) agh_arch=amd64 ;; \
+    arm64) agh_arch=arm64 ;; \
+    arm) \
+      case "$TARGETVARIANT" in \
+        v7) agh_arch=armv7 ;; \
+        v6) agh_arch=armv6 ;; \
+        *) echo "Unsupported ARM variant: TARGETVARIANT=$TARGETVARIANT" >&2; exit 1 ;; \
+      esac ;; \
+    *) echo "Unsupported architecture: TARGETARCH=$TARGETARCH TARGETVARIANT=$TARGETVARIANT" >&2; exit 1 ;; \
+  esac; \
+  curl -fL "https://github.com/AdguardTeam/AdGuardHome/releases/latest/download/AdGuardHome_linux_${agh_arch}.tar.gz" \
+    | tar -xz -C /tmp; \
+  install -m 0755 /tmp/AdGuardHome/AdGuardHome /out/AdGuardHome
 
 #############################
 # 4) Final distroless image #
 #############################
 FROM gcr.io/distroless/base-debian12
 # Copy binaries
-COPY --from=tailscale-builder /usr/bin/tailscaled /usr/bin/tailscaled
-COPY --from=tailscale-builder /usr/bin/tailscale  /usr/bin/tailscale
-COPY --from=adgh-builder     /out/AdGuardHome     /usr/local/bin/AdGuardHome
-COPY --from=entrypoint-builder /out/entrypoint    /entrypoint
+COPY --from=tailscale-builder   /usr/bin/tailscaled    /usr/bin/tailscaled
+COPY --from=tailscale-builder   /usr/bin/tailscale     /usr/bin/tailscale
+COPY --from=adgh-builder        /out/AdGuardHome       /usr/local/bin/AdGuardHome
+COPY --from=entrypoint-builder  /out/entrypoint        /entrypoint
 
-# Create necessary dirs
-# Note: use root in the image by default to allow low ports (53). You can drop caps at runtime as desired.
 WORKDIR /
 ENV PATH=/usr/bin:/usr/local/bin
 ENV TS_STATE_DIR=/var/lib/tailscale \
@@ -316,12 +317,8 @@ ENV TS_STATE_DIR=/var/lib/tailscale \
     TS_ACCEPT_DNS=false \
     TS_AUTH_ONCE=false
 
-# Data volumes
 VOLUME ["/var/lib/tailscale", "/opt/adguardhome/work", "/opt/adguardhome/conf"]
 
-# Expose common ports:
-# - 53/tcp+udp for DNS
-# - 3000/tcp for AdGuardHome initial setup UI (it can be changed in the UI/config later)
 EXPOSE 53/tcp 53/udp 3000/tcp
 
 ENTRYPOINT ["/entrypoint"]
