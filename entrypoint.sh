@@ -1,6 +1,8 @@
 #!/bin/sh
-# POSIX entrypoint for AdGuard Home + Tailscale (Option A)
+# POSIX entrypoint for AdGuard Home + Tailscale (fixed ordering + explicit exports)
 set -eu
+
+log() { printf '%s %s\n' "$(date -u '+%Y/%m/%d %T')" "$*"; }
 
 # Defaults (can be overridden via env)
 : "${TS_STATE_DIR:=/var/lib/tailscale}"
@@ -26,21 +28,25 @@ ensure_dir_or_fallback() {
   fi
 
   mkdir -p "$fb" 2>/dev/null || true
-  echo "Warning: cannot create $target, falling back to $fb" >&2
+  log "Warning: cannot create $target, falling back to $fb"
   printf '%s' "$fb"
   return 1
 }
 
-# Resolve state dir and socket parent BEFORE starting tailscaled
-TS_STATE_DIR="$(ensure_dir_or_fallback "$TS_STATE_DIR" ".tailscale")"
+# Resolve TS_STATE_DIR and TS_SOCKET BEFORE launching tailscaled
+RESOLVED_TS_STATE_DIR="$(ensure_dir_or_fallback "$TS_STATE_DIR" ".tailscale")"
+TS_STATE_DIR="$RESOLVED_TS_STATE_DIR"
+export TS_STATE_DIR
+
 TS_SOCKET_DIR="$(dirname "$TS_SOCKET")"
 if mkdir -p "$TS_SOCKET_DIR" 2>/dev/null; then
   :
 else
   fb="$(ensure_dir_or_fallback "$TS_SOCKET_DIR" ".tailscale")" || true
-  TS_SOCKET="${fb}/tailscaled.sock"
-  echo "Info: TS_SOCKET set to $TS_SOCKET" >&2
+  TS_SOCKET="$fb/tailscaled.sock"
+  log "Info: TS_SOCKET set to $TS_SOCKET"
 fi
+export TS_SOCKET
 
 # Ensure final dirs exist
 mkdir -p "$TS_STATE_DIR" 2>/dev/null || true
@@ -56,8 +62,17 @@ else
     DATA_DIR="/tmp/data"
   fi
   mkdir -p "$DATA_DIR" 2>/dev/null || true
-  echo "Info: using data dir $DATA_DIR" >&2
+  log "Info: using data dir $DATA_DIR"
 fi
+export DATA_DIR
+
+# Print resolved configuration to logs for debugging
+log "Starting with:"
+log "  TS_STATE_DIR=$TS_STATE_DIR"
+log "  TS_SOCKET=$TS_SOCKET"
+log "  DATA_DIR=$DATA_DIR"
+log "  TS_USERSPACE=${TS_USERSPACE:-}"
+log "  TS_ACCEPT_DNS=${TS_ACCEPT_DNS:-}"
 
 # Build Tailscale flags
 TS_AUTH_FLAGS=""
@@ -77,21 +92,24 @@ if [ "${TS_USERSPACE:-true}" = "true" ]; then
   TS_TAILSCALED_EXTRA_ARGS="${TS_TAILSCALED_EXTRA_ARGS:-} --tun=userspace-networking"
 fi
 
-# Start tailscaled with the resolved state/socket
+# Start tailscaled with the resolved state/socket (background)
 if [ -x /usr/local/bin/tailscaled ]; then
+  log "Launching tailscaled: --state=${TS_STATE_DIR}/tailscaled.state --socket=${TS_SOCKET} ${TS_TAILSCALED_EXTRA_ARGS:-}"
   /usr/local/bin/tailscaled \
     --state="${TS_STATE_DIR}/tailscaled.state" \
     --socket="${TS_SOCKET}" \
     ${TS_TAILSCALED_EXTRA_ARGS:-} &
+  TAILSCALED_PID=$!
 else
-  echo "Warning: tailscaled binary not found at /usr/local/bin/tailscaled" >&2
+  log "Warning: tailscaled binary not found at /usr/local/bin/tailscaled"
+  TAILSCALED_PID=0
 fi
 
-# Wait for tailscaled LocalAPI socket to appear (up to ~10s)
+# Wait for socket to appear (LocalAPI); fail gracefully if not present after timeout
 wait_for_socket() {
   socket="$1"
   tries=0
-  while [ "$tries" -lt 20 ]; do
+  while [ "$tries" -lt 40 ]; do
     if [ -S "$socket" ]; then
       return 0
     fi
@@ -101,21 +119,27 @@ wait_for_socket() {
   return 1
 }
 
-if ! wait_for_socket "$TS_SOCKET"; then
-  echo "Warning: tailscaled socket $TS_SOCKET did not appear in time" >&2
+if [ "$TAILSCALED_PID" -ne 0 ]; then
+  if wait_for_socket "$TS_SOCKET"; then
+    log "tailscaled LocalAPI socket appeared at $TS_SOCKET"
+  else
+    log "Warning: tailscaled socket $TS_SOCKET did not appear in time"
+  fi
 fi
 
 # Attempt to bring the node up; ignore failure to avoid container crash
 if [ -x /usr/local/bin/tailscale ]; then
-  /usr/local/bin/tailscale --socket="${TS_SOCKET}" up ${TS_UP_FLAGS:-} ${TS_AUTH_FLAGS:-} ${TS_EXTRA:-} || true
+  log "Running: tailscale --socket=${TS_SOCKET} up ${TS_UP_FLAGS} ${TS_AUTH_FLAGS} ${TS_EXTRA}"
+  /usr/local/bin/tailscale --socket="${TS_SOCKET}" up ${TS_UP_FLAGS:-} ${TS_AUTH_FLAGS:-} ${TS_EXTRA:-} || log "tailscale up returned non-zero (continuing)"
 else
-  echo "Warning: tailscale binary not found at /usr/local/bin/tailscale" >&2
+  log "Warning: tailscale binary not found at /usr/local/bin/tailscale"
 fi
 
 # Finally start AdGuard Home as PID 1
 if [ -x /usr/local/bin/AdGuardHome ]; then
+  log "Exec'ing AdGuardHome with work-dir ${DATA_DIR}"
   exec /usr/local/bin/AdGuardHome --no-check-update --config "${DATA_DIR}/AdGuardHome.yaml" --work-dir "${DATA_DIR}"
 else
-  echo "Error: AdGuardHome binary not found at /usr/local/bin/AdGuardHome" >&2
+  log "Error: AdGuardHome binary not found at /usr/local/bin/AdGuardHome"
   exit 1
 fi
