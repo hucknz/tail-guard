@@ -1,64 +1,327 @@
-FROM debian:stable-slim AS builder
+############################
+# 1) Build tiny entrypoint #
+############################
+FROM golang:1.23-bookworm AS entrypoint-builder
+WORKDIR /src
+# Embed the entrypoint source directly for a single-file setup
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build bash -eu -o pipefail <<'EOF'
+cat > main.go <<'GO'
+package main
 
-# Install tools (jq for JSON parsing, busybox-static for /bin/sh in final)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        curl \
-        tar \
-        ca-certificates \
-        jq \
-        busybox-static && \
-    rm -rf /var/lib/apt/lists/*
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+)
 
-# Copy and normalize entrypoint early and make executable
-COPY entrypoint.sh /entrypoint.sh
-RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+func getenv(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
 
-# Prepare a small /artifact/bin with busybox and /bin/sh symlink for final image
-RUN mkdir -p /artifact/bin && \
-    cp /bin/busybox /artifact/bin/busybox && \
-    ln -s busybox /artifact/bin/sh
+func strBoolEnv(k string, def bool) bool {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "1", "t", "true", "y", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
-# Download the latest Tailscale stable binary bundle (simpler method)
-RUN curl -fsSLo /tmp/tailscale.tgz "https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz" && \
-    tar -C /tmp -xzf /tmp/tailscale.tgz
+func splitArgs(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	// Simple whitespace split; quoting is not supported to keep image minimal.
+	return strings.Fields(s)
+}
 
-# Download the latest AdGuard Home release (linux_amd64)
-RUN AGH_URL=$(curl -fsS https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest | \
-      jq -r '.assets[] | select(.name | test("linux_amd64")) | .browser_download_url' | grep -v '\.sig' | head -n1) && \
-    curl -fsSLo /tmp/AdGuardHome.tar.gz "$AGH_URL" && \
-    tar -C /tmp -xzf /tmp/AdGuardHome.tar.gz
+func waitFor(cmdName string, args []string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		cmd := exec.CommandContext(ctx, cmdName, args...)
+		_ = cmd.Run()
+		cancel()
+		if cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s %v not ready after %s", cmdName, args, timeout)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
 
-# Ensure executables are present and executable
-RUN chmod +x /tmp/tailscale*/tailscaled /tmp/tailscale*/tailscale /tmp/AdGuardHome/AdGuardHome || true
+func pipeOutput(prefix string, r io.Reader) {
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				lines := strings.Split(string(buf[:n]), "\n")
+				for _, ln := range lines {
+					if strings.TrimSpace(ln) == "" {
+						continue
+					}
+					log.Printf("%s%s", prefix, ln)
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+}
 
-################################################################
-# Final runtime image: distroless base (minimal), running as root
-################################################################
+func startProc(name string, args ...string) (*exec.Cmd, error) {
+	cmd := exec.Command(name, args...)
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+	pipeOutput(fmt.Sprintf("[%s] ", filepath.Base(name)), stdout)
+	pipeOutput(fmt.Sprintf("[%s] ", filepath.Base(name)), stderr)
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return cmd, nil
+}
+
+func main() {
+	log.SetFlags(0)
+
+	// Env with defaults
+	tsStateDir := getenv("TS_STATE_DIR", "/var/lib/tailscale")
+	tsSocket := getenv("TS_SOCKET", "/var/run/tailscale/tailscaled.sock")
+	tsUserspace := strBoolEnv("TS_USERSPACE", true)
+	tsAuthOnce := strBoolEnv("TS_AUTH_ONCE", false)
+	tsAcceptDNS := strBoolEnv("TS_ACCEPT_DNS", false)
+	tsAuthKey := os.Getenv("TS_AUTHKEY")
+	tsRoutes := os.Getenv("TS_ROUTES")
+	tsHost := os.Getenv("TS_HOSTNAME")
+	tsSocks5 := os.Getenv("TS_SOCKS5_SERVER")
+	tsHTTPProxy := os.Getenv("TS_OUTBOUND_HTTP_PROXY_LISTEN")
+	tsExtraArgs := splitArgs(os.Getenv("TS_EXTRA_ARGS")) // to tailscale set
+	tsTailscaledExtra := splitArgs(os.Getenv("TS_TAILSCALED_EXTRA_ARGS"))
+	tsDestIP := os.Getenv("TS_DEST_IP")
+	tsKubeSecret := os.Getenv("TS_KUBE_SECRET") // not implemented; warn only
+
+	// Prepare dirs
+	_ = os.MkdirAll(tsStateDir, 0700)
+	_ = os.MkdirAll("/var/run/tailscale", 0755)
+	_ = os.MkdirAll("/opt/adguardhome/work", 0755)
+	_ = os.MkdirAll("/opt/adguardhome/conf", 0755)
+
+	if tsDestIP != "" {
+		log.Printf("[warn] TS_DEST_IP is not supported in this minimal distroless image (no iptables). Ignoring value: %q", tsDestIP)
+	}
+	if tsKubeSecret != "" {
+		log.Printf("[warn] TS_KUBE_SECRET is not implemented in this image. Mount a Kubernetes Secret to TS_STATE_DIR instead. Ignoring value: %q", tsKubeSecret)
+	}
+
+	// 1) Start tailscaled
+	tsdArgs := []string{
+		"--state=" + filepath.Join(tsStateDir, "tailscaled.state"),
+		"--socket=" + tsSocket,
+	}
+	if tsUserspace {
+		tsdArgs = append(tsdArgs, "--tun=userspace-networking")
+	}
+	tsdArgs = append(tsdArgs, tsTailscaledExtra...)
+
+	tsd, err := startProc("/usr/bin/tailscaled", tsdArgs...)
+	if err != nil {
+		log.Fatalf("failed to start tailscaled: %v", err)
+	}
+
+	// Ensure tailscale CLI can talk to daemon
+	if err := waitFor("/usr/bin/tailscale", []string{"--socket=" + tsSocket, "status"}, 30*time.Second); err != nil {
+		log.Fatalf("tailscaled not ready: %v", err)
+	}
+
+	// 2) tailscale up (unless already logged in and TS_AUTH_ONCE)
+	alreadyUp := func() bool {
+		cmd := exec.Command("/usr/bin/tailscale", "--socket="+tsSocket, "status", "--peers=false")
+		if err := cmd.Run(); err != nil {
+			return false
+		}
+		return true
+	}()
+
+	shouldUp := true
+	if tsAuthOnce && alreadyUp {
+		log.Printf("TS_AUTH_ONCE=true and Tailscale already up; skipping 'tailscale up'")
+		shouldUp = false
+	}
+
+	if shouldUp {
+		upArgs := []string{"--socket=" + tsSocket, "up"}
+		// Keep defaults explicit based on envs
+		upArgs = append(upArgs, fmt.Sprintf("--accept-dns=%v", tsAcceptDNS))
+		if tsUserspace {
+			upArgs = append(upArgs, "--tun=userspace-networking")
+		}
+		if tsAuthKey != "" {
+			upArgs = append(upArgs, "--authkey="+tsAuthKey)
+		}
+		if tsHost != "" {
+			upArgs = append(upArgs, "--hostname="+tsHost)
+		}
+		if tsRoutes != "" {
+			upArgs = append(upArgs, "--advertise-routes="+tsRoutes)
+		}
+		if tsSocks5 != "" {
+			upArgs = append(upArgs, "--socks5-server="+tsSocks5)
+		}
+		if tsHTTPProxy != "" {
+			upArgs = append(upArgs, "--outbound-http-proxy-listen="+tsHTTPProxy)
+		}
+		// Execute up
+		cmd := exec.Command("/usr/bin/tailscale", upArgs...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		log.Printf("Running: tailscale %s", strings.Join(upArgs, " "))
+		if err := cmd.Run(); err != nil {
+			log.Printf("[error] tailscale up failed: %v", err)
+			// If no authkey was provided, this might be an interactive login requirement; continue to run anyway.
+		}
+	}
+
+	// 3) Apply extra 'tailscale set' arguments, if provided
+	if len(tsExtraArgs) > 0 {
+		args := append([]string{"--socket=" + tsSocket, "set"}, tsExtraArgs...)
+		cmd := exec.Command("/usr/bin/tailscale", args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		log.Printf("Running: tailscale %s", strings.Join(args, " "))
+		if err := cmd.Run(); err != nil {
+			log.Printf("[warn] tailscale set failed: %v", err)
+		}
+	}
+
+	// 4) Start AdGuardHome
+	aghArgs := []string{
+		"--no-check-update",
+		"--work-dir", "/opt/adguardhome/work",
+		"--config", "/opt/adguardhome/conf/AdGuardHome.yaml",
+	}
+	agh, err := startProc("/usr/local/bin/AdGuardHome", aghArgs...)
+	if err != nil {
+		log.Fatalf("failed to start AdGuardHome: %v", err)
+	}
+
+	// 5) Signal handling and wait
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	var exitErr error
+
+waitLoop:
+	for {
+		select {
+		case sig := <-sigCh:
+			log.Printf("received signal: %s, forwarding to children", sig)
+			_ = tsd.Process.Signal(sig)
+			_ = agh.Process.Signal(sig)
+		default:
+			// poll children
+			tse := tsd.ProcessState
+			age := agh.ProcessState
+			if tsd.ProcessState != nil && tsd.ProcessState.Exited() {
+				exitErr = errors.New("tailscaled exited")
+				break waitLoop
+			}
+			if agh.ProcessState != nil && agh.ProcessState.Exited() {
+				exitErr = errors.New("AdGuardHome exited")
+				break waitLoop
+			}
+			// WaitNonblocking not available, sleep a bit
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+
+	// Final wait to reap
+	_, _ = tsd.Process.Wait()
+	_, _ = agh.Process.Wait()
+
+	if exitErr != nil {
+		log.Fatalf("exiting: %v", exitErr)
+	}
+}
+GO
+go build -trimpath -ldflags="-s -w" -o /out/entrypoint .
+EOF
+
+#############################
+# 2) Get latest Tailscale   #
+#############################
+FROM debian:bookworm-slim AS tailscale-builder
+SHELL ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
+RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg ca-certificates && rm -rf /var/lib/apt/lists/*
+# Add Tailscale apt repo and install latest stable
+RUN curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null \
+ && curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.tailscale-keyring.list | tee /etc/apt/sources.list.d/tailscale.list >/dev/null \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends tailscale \
+ && rm -rf /var/lib/apt/lists/*
+
+#############################
+# 3) Get latest AdGuardHome #
+#############################
+FROM debian:bookworm-slim AS adgh-builder
+SHELL ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tar && rm -rf /var/lib/apt/lists/*
+# Resolve architecture to AdGuardHome asset name
+RUN arch="$(dpkg --print-architecture)" \
+ && case "$arch" in \
+      amd64) agh_arch=amd64 ;; \
+      arm64) agh_arch=arm64 ;; \
+      *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL "https://github.com/AdguardTeam/AdGuardHome/releases/latest/download/AdGuardHome_linux_${agh_arch}.tar.gz" \
+    | tar -xz -C /tmp \
+ && install -m 0755 /tmp/AdGuardHome/AdGuardHome /out/AdGuardHome
+
+#############################
+# 4) Final distroless image #
+#############################
 FROM gcr.io/distroless/base-debian12
+# Copy binaries
+COPY --from=tailscale-builder /usr/bin/tailscaled /usr/bin/tailscaled
+COPY --from=tailscale-builder /usr/bin/tailscale  /usr/bin/tailscale
+COPY --from=adgh-builder     /out/AdGuardHome     /usr/local/bin/AdGuardHome
+COPY --from=entrypoint-builder /out/entrypoint    /entrypoint
 
-# Default environment (user can override)
-ENV TS_STATE_DIR="/var/lib/tailscale" \
-    TS_SOCKET="/var/run/tailscale/tailscaled.sock" \
-    TS_KUBE_SECRET="tailscale" \
-    TS_USERSPACE="true"
+# Create necessary dirs
+# Note: use root in the image by default to allow low ports (53). You can drop caps at runtime as desired.
+WORKDIR /
+ENV PATH=/usr/bin:/usr/local/bin
+ENV TS_STATE_DIR=/var/lib/tailscale \
+    TS_SOCKET=/var/run/tailscale/tailscaled.sock \
+    TS_USERSPACE=true \
+    TS_ACCEPT_DNS=false \
+    TS_AUTH_ONCE=false
 
-# Provide a minimal /bin with busybox so our /entrypoint.sh's shebang works
-COPY --from=builder /artifact/bin /bin
+# Data volumes
+VOLUME ["/var/lib/tailscale", "/opt/adguardhome/work", "/opt/adguardhome/conf"]
 
-# Copy normalized executable entrypoint
-COPY --from=builder /entrypoint.sh /entrypoint.sh
+# Expose common ports:
+# - 53/tcp+udp for DNS
+# - 3000/tcp for AdGuardHome initial setup UI (it can be changed in the UI/config later)
+EXPOSE 53/tcp 53/udp 3000/tcp
 
-# Copy tailscale and AdGuard binaries
-COPY --from=builder /tmp/tailscale*/tailscaled /usr/local/bin/tailscaled
-COPY --from=builder /tmp/tailscale*/tailscale /usr/local/bin/tailscale
-COPY --from=builder /tmp/AdGuardHome/AdGuardHome /usr/local/bin/AdGuardHome
-
-# Volumes and ports
-VOLUME ["/var/lib/tailscale", "/data"]
-EXPOSE 53/udp 53/tcp 67/udp 80/tcp 443/tcp 3000/tcp
-
-# Run as root in the container (not rootless). This allows tailscaled and AdGuard to create system dirs on first run.
-WORKDIR /root
-
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/entrypoint"]
