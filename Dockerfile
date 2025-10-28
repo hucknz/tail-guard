@@ -1,12 +1,3 @@
-# Distroless image running Tailscale + AdGuardHome
-# - Latest Tailscale via official apt repo (builder)
-# - Latest AdGuardHome via GitHub "latest/download" (builder, multi-arch)
-# - Minimal Go entrypoint orchestrating both processes
-# - Supports envs: TS_ACCEPT_DNS, TS_AUTH_ONCE, TS_AUTHKEY, TS_DEST_IP (warn),
-#   TS_KUBE_SECRET (warn), TS_HOSTNAME, TS_OUTBOUND_HTTP_PROXY_LISTEN, TS_ROUTES,
-#   TS_SOCKET, TS_SOCKS5_SERVER, TS_STATE_DIR, TS_USERSPACE (default true),
-#   TS_EXTRA_ARGS, TS_TAILSCALED_EXTRA_ARGS
-
 ############################
 # 1) Build tiny entrypoint #
 ############################
@@ -53,12 +44,28 @@ func strBoolEnv(k string, def bool) bool {
 	}
 }
 
+// unquote removes a single pair of matching leading/trailing quotes (' or ")
+// without attempting full shell parsing.
+func unquote(s string) string {
+	if len(s) >= 2 {
+		if (s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
+// splitArgs splits on whitespace and then strips wrapping quotes from each token.
 func splitArgs(s string) []string {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return nil
 	}
-	return strings.Fields(s)
+	toks := strings.Fields(s)
+	for i := range toks {
+		toks[i] = unquote(toks[i])
+	}
+	return toks
 }
 
 func waitFor(cmdName string, args []string, timeout time.Duration) error {
@@ -120,15 +127,19 @@ func main() {
 	tsUserspace := strBoolEnv("TS_USERSPACE", true)
 	tsAuthOnce := strBoolEnv("TS_AUTH_ONCE", false)
 	tsAcceptDNS := strBoolEnv("TS_ACCEPT_DNS", false)
-	tsAuthKey := os.Getenv("TS_AUTHKEY")
-	tsRoutes := os.Getenv("TS_ROUTES")
-	tsHost := os.Getenv("TS_HOSTNAME")
-	tsSocks5 := os.Getenv("TS_SOCKS5_SERVER")
-	tsHTTPProxy := os.Getenv("TS_OUTBOUND_HTTP_PROXY_LISTEN")
-	tsExtraArgs := splitArgs(os.Getenv("TS_EXTRA_ARGS")) // to tailscale set
-	tsTailscaledExtra := splitArgs(os.Getenv("TS_TAILSCALED_EXTRA_ARGS"))
-	tsDestIP := os.Getenv("TS_DEST_IP")
-	tsKubeSecret := os.Getenv("TS_KUBE_SECRET") // not implemented; warn only
+
+	// Unquote single-value envs to be forgiving if users wrap values in '...'/ "..."
+	tsAuthKey := unquote(os.Getenv("TS_AUTHKEY"))
+	tsRoutes := unquote(os.Getenv("TS_ROUTES"))
+	tsHost := unquote(os.Getenv("TS_HOSTNAME"))
+	tsSocks5 := unquote(os.Getenv("TS_SOCKS5_SERVER"))
+	tsHTTPProxy := unquote(os.Getenv("TS_OUTBOUND_HTTP_PROXY_LISTEN"))
+	tsDestIP := unquote(os.Getenv("TS_DEST_IP"))
+	tsKubeSecret := unquote(os.Getenv("TS_KUBE_SECRET")) // not implemented; warn only
+
+	// Args-style envs: split and unquote each token
+	tsExtraArgs := splitArgs(os.Getenv("TS_EXTRA_ARGS"))                 // for "tailscale set"
+	tsTailscaledExtra := splitArgs(os.Getenv("TS_TAILSCALED_EXTRA_ARGS")) // for "tailscaled"
 
 	// Prepare dirs
 	_ = os.MkdirAll(tsStateDir, 0700)
@@ -178,7 +189,7 @@ func main() {
 	if shouldUp {
 		upArgs := []string{"--socket=" + tsSocket, "up"}
 		upArgs = append(upArgs, fmt.Sprintf("--accept-dns=%v", tsAcceptDNS))
-		// DO NOT pass --tun to "tailscale up"; it's a tailscaled flag only.
+		// DO NOT pass --tun to "tailscale up"; it's for tailscaled only.
 		if tsAuthKey != "" {
 			upArgs = append(upArgs, "--auth-key="+tsAuthKey)
 		}
