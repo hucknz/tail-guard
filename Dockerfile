@@ -1,7 +1,7 @@
 # Distroless image running Tailscale + AdGuardHome
 # - Latest Tailscale via official apt repo (builder)
 # - Latest AdGuardHome via GitHub "latest/download" (builder, multi-arch)
-# - Minimal Go entrypoint (no shell) orchestrating both processes
+# - Minimal Go entrypoint orchestrating both processes
 # - Supports envs: TS_ACCEPT_DNS, TS_AUTH_ONCE, TS_AUTHKEY, TS_DEST_IP (warn),
 #   TS_KUBE_SECRET (warn), TS_HOSTNAME, TS_OUTBOUND_HTTP_PROXY_LISTEN, TS_ROUTES,
 #   TS_SOCKET, TS_SOCKS5_SERVER, TS_STATE_DIR, TS_USERSPACE (default true),
@@ -158,13 +158,15 @@ func main() {
 		log.Fatalf("failed to start tailscaled: %v", err)
 	}
 
-	// Ensure tailscale CLI can talk to daemon
-	if err := waitFor("/usr/bin/tailscale", []string{"--socket=" + tsSocket, "status"}, 30*time.Second); err != nil {
+	// Ensure the LocalAPI is reachable (daemon ready), even if not logged in yet.
+	// Use "version" (always zero exit when daemon reachable) instead of "status" (non-zero when NeedsLogin).
+	if err := waitFor("/usr/bin/tailscale", []string{"--socket=" + tsSocket, "version"}, 30*time.Second); err != nil {
 		log.Fatalf("tailscaled not ready: %v", err)
 	}
 
 	// 2) tailscale up (unless already logged in and TS_AUTH_ONCE)
 	alreadyUp := func() bool {
+		// "status" still useful to detect a fully running node; ignore output.
 		cmd := exec.Command("/usr/bin/tailscale", "--socket="+tsSocket, "status", "--peers=false")
 		return cmd.Run() == nil
 	}()
@@ -202,6 +204,7 @@ func main() {
 		log.Printf("Running: tailscale %s", strings.Join(upArgs, " "))
 		if err := cmd.Run(); err != nil {
 			log.Printf("[error] tailscale up failed: %v", err)
+			// If no authkey was provided, this may require interactive login; container keeps running.
 		}
 	}
 
