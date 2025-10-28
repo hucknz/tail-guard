@@ -1,17 +1,21 @@
-# Small distroless image running Tailscale + AdGuardHome
-# - Latest Tailscale via official apt repo (in builder)
-# - Latest AdGuardHome via GitHub "latest/download" with multi-arch support
-# - Distroless final image with a tiny Go entrypoint (no shell)
+# Distroless image running Tailscale + AdGuardHome
+# - Latest Tailscale via official apt repo (builder)
+# - Latest AdGuardHome via GitHub "latest/download" (builder, multi-arch)
+# - Minimal Go entrypoint (no shell) orchestrating both processes
+# - Supports envs: TS_ACCEPT_DNS, TS_AUTH_ONCE, TS_AUTHKEY, TS_DEST_IP (warn),
+#   TS_KUBE_SECRET (warn), TS_HOSTNAME, TS_OUTBOUND_HTTP_PROXY_LISTEN, TS_ROUTES,
+#   TS_SOCKET, TS_SOCKS5_SERVER, TS_STATE_DIR, TS_USERSPACE (default true),
+#   TS_EXTRA_ARGS, TS_TAILSCALED_EXTRA_ARGS
 
 ############################
 # 1) Build tiny entrypoint #
 ############################
 FROM golang:1.23-bookworm AS entrypoint-builder
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 WORKDIR /src
 RUN mkdir -p /out
-# Embed the entrypoint source directly for a single-file setup
-RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build bash -eu -o pipefail <<'EOF'
-cat > main.go <<'GO'
+# Write the entrypoint source
+RUN cat > main.go <<'GO'
 package main
 
 import (
@@ -257,14 +261,14 @@ waitLoop:
 	}
 }
 GO
-go build -trimpath -ldflags="-s -w" -o /out/entrypoint .
-EOF
+# Build the entrypoint without requiring a go.mod
+RUN CGO_ENABLED=0 GOFLAGS="-trimpath" go build -ldflags="-s -w" -o /out/entrypoint ./main.go
 
 #############################
 # 2) Get latest Tailscale   #
 #############################
 FROM debian:bookworm-slim AS tailscale-builder
-SHELL ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg ca-certificates && rm -rf /var/lib/apt/lists/*
 # Add Tailscale apt repo and install latest stable
 RUN curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null \
@@ -277,27 +281,26 @@ RUN curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg | t
 # 3) Get latest AdGuardHome #
 #############################
 FROM debian:bookworm-slim AS adgh-builder
-SHELL ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 ARG TARGETARCH
 ARG TARGETVARIANT
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tar && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /out
 # Use buildx-provided TARGETARCH/TARGETVARIANT to choose the correct asset
-RUN set -euxo pipefail; \
-  case "$TARGETARCH" in \
-    amd64) agh_arch=amd64 ;; \
-    arm64) agh_arch=arm64 ;; \
-    arm) \
-      case "$TARGETVARIANT" in \
-        v7) agh_arch=armv7 ;; \
-        v6) agh_arch=armv6 ;; \
-        *) echo "Unsupported ARM variant: TARGETVARIANT=$TARGETVARIANT" >&2; exit 1 ;; \
-      esac ;; \
-    *) echo "Unsupported architecture: TARGETARCH=$TARGETARCH TARGETVARIANT=$TARGETVARIANT" >&2; exit 1 ;; \
-  esac; \
-  curl -fL "https://github.com/AdguardTeam/AdGuardHome/releases/latest/download/AdGuardHome_linux_${agh_arch}.tar.gz" \
-    | tar -xz -C /tmp; \
-  install -m 0755 /tmp/AdGuardHome/AdGuardHome /out/AdGuardHome
+RUN case "$TARGETARCH" in \
+      amd64) agh_arch=amd64 ;; \
+      arm64) agh_arch=arm64 ;; \
+      arm) \
+        case "$TARGETVARIANT" in \
+          v7) agh_arch=armv7 ;; \
+          v6) agh_arch=armv6 ;; \
+          *) echo "Unsupported ARM variant: TARGETVARIANT=$TARGETVARIANT" >&2; exit 1 ;; \
+        esac ;; \
+      *) echo "Unsupported architecture: TARGETARCH=$TARGETARCH TARGETVARIANT=$TARGETVARIANT" >&2; exit 1 ;; \
+    esac; \
+    curl -fL --retry 5 --retry-delay 2 "https://github.com/AdguardTeam/AdGuardHome/releases/latest/download/AdGuardHome_linux_${agh_arch}.tar.gz" \
+      | tar -xz -C /tmp; \
+    install -m 0755 /tmp/AdGuardHome/AdGuardHome /out/AdGuardHome
 
 #############################
 # 4) Final distroless image #
@@ -319,6 +322,7 @@ ENV TS_STATE_DIR=/var/lib/tailscale \
 
 VOLUME ["/var/lib/tailscale", "/opt/adguardhome/work", "/opt/adguardhome/conf"]
 
+# DNS and AdGuardHome UI (default first-run UI port 3000)
 EXPOSE 53/tcp 53/udp 3000/tcp
 
 ENTRYPOINT ["/entrypoint"]
