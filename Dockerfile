@@ -143,7 +143,7 @@ func main() {
 		log.Printf("[warn] TS_KUBE_SECRET is not implemented in this image. Mount a Kubernetes Secret to TS_STATE_DIR instead. Ignoring value: %q", tsKubeSecret)
 	}
 
-	// 1) Start tailscaled
+	// 1) Start tailscaled (userspace networking handled here)
 	tsdArgs := []string{
 		"--state=" + filepath.Join(tsStateDir, "tailscaled.state"),
 		"--socket=" + tsSocket,
@@ -159,14 +159,12 @@ func main() {
 	}
 
 	// Ensure the LocalAPI is reachable (daemon ready), even if not logged in yet.
-	// Use "version" (always zero exit when daemon reachable) instead of "status" (non-zero when NeedsLogin).
 	if err := waitFor("/usr/bin/tailscale", []string{"--socket=" + tsSocket, "version"}, 30*time.Second); err != nil {
 		log.Fatalf("tailscaled not ready: %v", err)
 	}
 
 	// 2) tailscale up (unless already logged in and TS_AUTH_ONCE)
 	alreadyUp := func() bool {
-		// "status" still useful to detect a fully running node; ignore output.
 		cmd := exec.Command("/usr/bin/tailscale", "--socket="+tsSocket, "status", "--peers=false")
 		return cmd.Run() == nil
 	}()
@@ -180,11 +178,9 @@ func main() {
 	if shouldUp {
 		upArgs := []string{"--socket=" + tsSocket, "up"}
 		upArgs = append(upArgs, fmt.Sprintf("--accept-dns=%v", tsAcceptDNS))
-		if tsUserspace {
-			upArgs = append(upArgs, "--tun=userspace-networking")
-		}
+		// DO NOT pass --tun to "tailscale up"; it's a tailscaled flag only.
 		if tsAuthKey != "" {
-			upArgs = append(upArgs, "--authkey="+tsAuthKey)
+			upArgs = append(upArgs, "--auth-key="+tsAuthKey)
 		}
 		if tsHost != "" {
 			upArgs = append(upArgs, "--hostname="+tsHost)
@@ -204,7 +200,7 @@ func main() {
 		log.Printf("Running: tailscale %s", strings.Join(upArgs, " "))
 		if err := cmd.Run(); err != nil {
 			log.Printf("[error] tailscale up failed: %v", err)
-			// If no authkey was provided, this may require interactive login; container keeps running.
+			// If no auth key is provided, login might be required; container keeps running.
 		}
 	}
 
@@ -310,11 +306,10 @@ RUN case "$TARGETARCH" in \
 #############################
 FROM gcr.io/distroless/base-debian12
 # Copy binaries
-# tailscaled is installed at /usr/sbin/tailscaled in Debian; copy it into /usr/bin in the final image.
 COPY --from=tailscale-builder   /usr/sbin/tailscaled    /usr/bin/tailscaled
-COPY --from=tailscale-builder   /usr/bin/tailscale     /usr/bin/tailscale
-COPY --from=adgh-builder        /out/AdGuardHome       /usr/local/bin/AdGuardHome
-COPY --from=entrypoint-builder  /out/entrypoint        /entrypoint
+COPY --from=tailscale-builder   /usr/bin/tailscale      /usr/bin/tailscale
+COPY --from=adgh-builder        /out/AdGuardHome        /usr/local/bin/AdGuardHome
+COPY --from=entrypoint-builder  /out/entrypoint         /entrypoint
 
 WORKDIR /
 ENV PATH=/usr/bin:/usr/local/bin
