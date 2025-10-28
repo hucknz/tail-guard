@@ -307,7 +307,8 @@ RUN case "$TARGETARCH" in \
 #############################
 FROM gcr.io/distroless/base-debian12
 # Copy binaries
-COPY --from=tailscale-builder   /usr/bin/tailscaled    /usr/bin/tailscaled
+# tailscaled is installed at /usr/sbin/tailscaled in Debian; copy it into /usr/bin in the final image.
+COPY --from=tailscale-builder   /usr/sbin/tailscaled    /usr/bin/tailscaled
 COPY --from=tailscale-builder   /usr/bin/tailscale     /usr/bin/tailscale
 COPY --from=adgh-builder        /out/AdGuardHome       /usr/local/bin/AdGuardHome
 COPY --from=entrypoint-builder  /out/entrypoint        /entrypoint
