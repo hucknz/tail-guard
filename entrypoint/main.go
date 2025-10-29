@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -35,8 +36,7 @@ func strBoolEnv(k string, def bool) bool {
 	}
 }
 
-// unquote removes a single pair of matching leading/trailing quotes (' or ")
-// without attempting full shell parsing.
+// unquote removes a single pair of matching leading/trailing quotes (' or ") without attempting full shell parsing.
 func unquote(s string) string {
 	if len(s) >= 2 {
 		if (s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"') {
@@ -114,15 +114,15 @@ func ensureDir(path string, mode os.FileMode) {
 	_ = os.Chmod(path, mode) // enforce mode even if pre-existing (e.g., mounted)
 }
 
-// Add after ensuring directories but before starting tailscaled
+// Overwrite resolv.conf so DNS queries are handled locally
 func setupLocalDNS() error {
-    resolv := `nameserver 127.0.0.1
+	resolv := `nameserver 127.0.0.1
 nameserver fdaa::3
 `
-    return os.WriteFile("/etc/resolv.conf", []byte(resolv), 0644)
+	return os.WriteFile("/etc/resolv.conf", []byte(resolv), 0644)
 }
 
-// wait up to timeout for a Tailscale 100.x IP to be present
+// Wait up to timeout for a Tailscale 100.x IP to be present
 func waitForTailscaleIP(socket string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -139,14 +139,42 @@ func waitForTailscaleIP(socket string, timeout time.Duration) error {
 	}
 }
 
+func buildTailscaleUpArgs(tsSocket string, tsAcceptDNS bool, tsAuthKey, tsHost, tsRoutes, tsSocks5, tsHTTPProxy string) []string {
+	upArgs := []string{"--socket=" + tsSocket, "up"}
+	upArgs = append(upArgs, fmt.Sprintf("--accept-dns=%v", tsAcceptDNS))
+
+	// Include commonly used non-default flags when requested via env. These prevent tailscale returning the "requires mentioning all non-default flags" error.
+	if tsAuthKey != "" {
+		upArgs = append(upArgs, "--auth-key="+tsAuthKey)
+	}
+	if tsHost != "" {
+		upArgs = append(upArgs, "--hostname="+tsHost)
+	}
+	if tsRoutes != "" {
+		upArgs = append(upArgs, "--advertise-routes="+tsRoutes)
+	}
+	if strBoolEnv("TS_ADVERTISE_EXIT_NODE", false) {
+		upArgs = append(upArgs, "--advertise-exit-node")
+	}
+	if strBoolEnv("TS_ACCEPT_ROUTES", false) {
+		upArgs = append(upArgs, "--accept-routes")
+	}
+	if tsSocks5 != "" {
+		upArgs = append(upArgs, "--socks5-server="+tsSocks5)
+	}
+	if tsHTTPProxy != "" {
+		upArgs = append(upArgs, "--outbound-http-proxy-listen="+tsHTTPProxy)
+	}
+	return upArgs
+}
+
 func main() {
 	log.SetFlags(0)
 
 	// Base data dir for everything (single volume)
 	dataDir := getenv("DATA_DIR", "/data")
 
-	// Env with defaults
-	// If TS_STATE_DIR is unset, store Tailscale state under dataDir/tailscale
+	// Environment with defaults. If TS_STATE_DIR is unset, store Tailscale state under dataDir/tailscale
 	tsStateDir := getenv("TS_STATE_DIR", filepath.Join(dataDir, "tailscale"))
 	tsSocket := getenv("TS_SOCKET", "/var/run/tailscale/tailscaled.sock")
 	tsUserspace := strBoolEnv("TS_USERSPACE", true)
@@ -187,7 +215,7 @@ func main() {
 		log.Printf("[warn] TS_KUBE_SECRET is not implemented in this image. Mount a Kubernetes Secret to TS_STATE_DIR instead. Ignoring value: %q", tsKubeSecret)
 	}
 
-	// 1) Start tailscaled (userspace networking handled here)
+	// Start tailscaled (userspace networking handled here)
 	tsdArgs := []string{
 		"--state=" + filepath.Join(tsStateDir, "tailscaled.state"),
 		"--socket=" + tsSocket,
@@ -207,7 +235,7 @@ func main() {
 		log.Fatalf("tailscaled not ready: %v", err)
 	}
 
-	// 2) tailscale up (unless already logged in and TS_AUTH_ONCE)
+	// Tailscale up (unless already logged in and TS_AUTH_ONCE)
 	alreadyUp := func() bool {
 		cmd := exec.Command("/usr/bin/tailscale", "--socket="+tsSocket, "status", "--peers=false")
 		return cmd.Run() == nil
@@ -220,35 +248,41 @@ func main() {
 	}
 
 	if shouldUp {
-		upArgs := []string{"--socket=" + tsSocket, "up"}
-		upArgs = append(upArgs, fmt.Sprintf("--accept-dns=%v", tsAcceptDNS))
-		// Do not pass --tun to "tailscale up"; it's for tailscaled only.
-		if tsAuthKey != "" {
-			upArgs = append(upArgs, "--auth-key="+tsAuthKey)
-		}
-		if tsHost != "" {
-			upArgs = append(upArgs, "--hostname="+tsHost)
-		}
-		if tsRoutes != "" {
-			upArgs = append(upArgs, "--advertise-routes="+tsRoutes)
-		}
-		if tsSocks5 != "" {
-			upArgs = append(upArgs, "--socks5-server="+tsSocks5)
-		}
-		if tsHTTPProxy != "" {
-			upArgs = append(upArgs, "--outbound-http-proxy-listen="+tsHTTPProxy)
-		}
+		upArgs := buildTailscaleUpArgs(tsSocket, tsAcceptDNS, tsAuthKey, tsHost, tsRoutes, tsSocks5, tsHTTPProxy)
+		// run tailscale up and capture stderr to detect the "mention all non-default flags" error
+		var stderr bytes.Buffer
 		cmd := exec.Command("/usr/bin/tailscale", upArgs...)
 		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		cmd.Stderr = &stderr
 		log.Printf("Running: tailscale %s", strings.Join(upArgs, " "))
 		if err := cmd.Run(); err != nil {
+			stderrStr := stderr.String()
 			log.Printf("[error] tailscale up failed: %v", err)
-			// If no auth key is provided, interactive login might be required; container keeps running.
+			// Detect the specific error from tailscale that asks to "mention all non-default flags"
+			if strings.Contains(stderrStr, "requires mentioning all non-default flags") {
+				// If TS_FORCE_RESET=true, retry with --reset (destructive: clears previously stored non-default flags)
+				if strBoolEnv("TS_FORCE_RESET", false) {
+					log.Printf("[info] tailscale up indicates non-default flags; retrying with --reset due to TS_FORCE_RESET=true")
+					upArgs = append(upArgs, "--reset")
+					cmd2 := exec.Command("/usr/bin/tailscale", upArgs...)
+					cmd2.Stdout = os.Stdout
+					cmd2.Stderr = os.Stderr
+					if err := cmd2.Run(); err != nil {
+						log.Printf("[error] tailscale up --reset failed: %v", err)
+					} else {
+						log.Printf("[info] tailscale up --reset succeeded")
+					}
+				} else {
+					// Log the stderr and a helpful hint showing which flags the entrypoint can supply
+					log.Printf("[error] tailscale up requires all non-default flags to be mentioned. stderr: %s", stderrStr)
+					log.Printf("[hint] Set environment variables so the entrypoint supplies commonly-used non-default flags:")
+					log.Printf("[hint] TS_ADVERTISE_EXIT_NODE=true  TS_ACCEPT_ROUTES=true  TS_FORCE_RESET=true (if you want an automatic reset)")
+				}
+			}
 		}
 	}
 
-	// 3) Apply extra 'tailscale set' arguments, if provided
+	// Apply extra 'tailscale set' arguments, if provided
 	if len(tsExtraArgs) > 0 {
 		args := append([]string{"--socket=" + tsSocket, "set"}, tsExtraArgs...)
 		cmd := exec.Command("/usr/bin/tailscale", args...)
@@ -260,14 +294,14 @@ func main() {
 		}
 	}
 
-	// after tailscale up and any set commands:
+	// After tailscale up and any set commands:
 	if err := waitForTailscaleIP(tsSocket, 10*time.Second); err != nil {
 		log.Printf("[warn] tailscale IP not found: %v — continuing, but DNS routing may fail", err)
 	} else {
 		log.Printf("[info] tailscale IP detected; starting AdGuard")
 	}
 
-	// 4) Start AdGuardHome
+	// Start AdGuardHome
 	aghArgs := []string{
 		"--no-check-update",
 		"--work-dir", aghWork,
@@ -278,11 +312,11 @@ func main() {
 		log.Fatalf("failed to start AdGuardHome: %v", err)
 	}
 
-	// 5) Signal handling and wait
+	// Signal handling and wait
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	// Add: graceful logout on first termination signal
+	// Graceful logout on first termination signal, removes ephemeral nodes immediately
 	loggedOut := make(chan struct{}, 1)
 	go func() {
 		sig := <-sigCh
