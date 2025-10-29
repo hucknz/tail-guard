@@ -114,6 +114,14 @@ func ensureDir(path string, mode os.FileMode) {
 	_ = os.Chmod(path, mode) // enforce mode even if pre-existing (e.g., mounted)
 }
 
+// Add after ensuring directories but before starting tailscaled
+func setupLocalDNS() error {
+    resolv := `nameserver 127.0.0.1
+nameserver fdaa::3
+`
+    return os.WriteFile("/etc/resolv.conf", []byte(resolv), 0644)
+}
+
 // wait up to timeout for a Tailscale 100.x IP to be present
 func waitForTailscaleIP(socket string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
