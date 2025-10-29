@@ -176,6 +176,10 @@ func main() {
 	ensureDir(aghWork, 0700)
 	ensureDir(aghConf, 0700)
 
+	if err := setupLocalDNS(); err != nil {
+		log.Printf("[warn] failed to setup local DNS: %v", err)
+	}
+
 	if tsDestIP != "" {
 		log.Printf("[warn] TS_DEST_IP is not supported in this minimal distroless image (no iptables). Ignoring value: %q", tsDestIP)
 	}
