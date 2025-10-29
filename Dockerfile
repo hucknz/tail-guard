@@ -3,7 +3,7 @@
 ############################
 FROM golang:1.23-bookworm AS entrypoint-builder
 WORKDIR /src
-COPY go.mod go.sum ./
+COPY go.mod ./
 RUN go mod download
 COPY entrypoint/ ./entrypoint/
 RUN mkdir -p /out \
