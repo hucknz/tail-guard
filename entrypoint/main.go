@@ -114,6 +114,23 @@ func ensureDir(path string, mode os.FileMode) {
 	_ = os.Chmod(path, mode) // enforce mode even if pre-existing (e.g., mounted)
 }
 
+// wait up to timeout for a Tailscale 100.x IP to be present
+func waitForTailscaleIP(socket string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		out, _ := exec.Command("/usr/bin/tailscale", "--socket="+socket, "ip").CombinedOutput()
+		s := strings.TrimSpace(string(out))
+		// tailscale ip may return multiple addresses; look for the 100.x/100:* family
+		if s != "" && (strings.Contains(s, "100.") || strings.Contains(s, "100:")) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no tailscale IP after %s: output=%q", timeout, s)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
 func main() {
 	log.SetFlags(0)
 
@@ -231,6 +248,13 @@ func main() {
 		}
 	}
 
+	// after tailscale up and any set commands:
+	if err := waitForTailscaleIP(tsSocket, 10*time.Second); err != nil {
+		log.Printf("[warn] tailscale IP not found: %v — continuing, but DNS routing may fail", err)
+	} else {
+		log.Printf("[info] tailscale IP detected; starting AdGuard")
+	}
+
 	// 4) Start AdGuardHome
 	aghArgs := []string{
 		"--no-check-update",
@@ -245,6 +269,28 @@ func main() {
 	// 5) Signal handling and wait
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	// Add: graceful logout on first termination signal
+	loggedOut := make(chan struct{}, 1)
+	go func() {
+		sig := <-sigCh
+		log.Printf("received signal: %s, initiating graceful logout", sig)
+
+		// Try a quick forced logout so the node is removed immediately
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "/usr/bin/tailscale", "--socket="+tsSocket, "logout", "--force")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		_ = cmd.Run() // best-effort; continue regardless
+
+		// Forward the signal to children to stop them
+		_ = tsd.Process.Signal(sig)
+		_ = agh.Process.Signal(sig)
+
+		close(loggedOut)
+	}()
+
 	var exitErr error
 
 waitLoop:
