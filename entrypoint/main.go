@@ -36,7 +36,8 @@ func strBoolEnv(k string, def bool) bool {
 	}
 }
 
-// unquote removes a single pair of matching leading/trailing quotes (' or ") without attempting full shell parsing.
+// unquote removes a single pair of matching leading/trailing quotes (' or ")
+// without attempting full shell parsing.
 func unquote(s string) string {
 	if len(s) >= 2 {
 		if (s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"') {
@@ -114,15 +115,10 @@ func ensureDir(path string, mode os.FileMode) {
 	_ = os.Chmod(path, mode) // enforce mode even if pre-existing (e.g., mounted)
 }
 
-// Overwrite resolv.conf so DNS queries are handled locally
-func setupLocalDNS() error {
-	resolv := `nameserver 127.0.0.1
-nameserver fdaa::3
-`
-	return os.WriteFile("/etc/resolv.conf", []byte(resolv), 0644)
-}
+// NOTE: setupLocalDNS() is implemented in setup_local_dns.go in the same package.
+// Make sure that file is present in the build (package main).
 
-// Wait up to timeout for a Tailscale 100.x IP to be present
+// wait up to timeout for a Tailscale 100.x IP to be present
 func waitForTailscaleIP(socket string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -141,9 +137,10 @@ func waitForTailscaleIP(socket string, timeout time.Duration) error {
 
 func buildTailscaleUpArgs(tsSocket string, tsAcceptDNS bool, tsAuthKey, tsHost, tsRoutes, tsSocks5, tsHTTPProxy string) []string {
 	upArgs := []string{"--socket=" + tsSocket, "up"}
+	// Use explicit true/false for accept-dns to be deterministic.
 	upArgs = append(upArgs, fmt.Sprintf("--accept-dns=%v", tsAcceptDNS))
 
-	// Include commonly used non-default flags when requested via env. These prevent tailscale returning the "requires mentioning all non-default flags" error.
+	// Include commonly used non-default flags when requested via env.
 	if tsAuthKey != "" {
 		upArgs = append(upArgs, "--auth-key="+tsAuthKey)
 	}
@@ -174,7 +171,8 @@ func main() {
 	// Base data dir for everything (single volume)
 	dataDir := getenv("DATA_DIR", "/data")
 
-	// Environment with defaults. If TS_STATE_DIR is unset, store Tailscale state under dataDir/tailscale
+	// Env with defaults
+	// If TS_STATE_DIR is unset, store Tailscale state under dataDir/tailscale
 	tsStateDir := getenv("TS_STATE_DIR", filepath.Join(dataDir, "tailscale"))
 	tsSocket := getenv("TS_SOCKET", "/var/run/tailscale/tailscaled.sock")
 	tsUserspace := strBoolEnv("TS_USERSPACE", true)
@@ -190,6 +188,14 @@ func main() {
 	tsDestIP := unquote(os.Getenv("TS_DEST_IP"))
 	tsKubeSecret := unquote(os.Getenv("TS_KUBE_SECRET")) // not implemented; warn only
 
+	// Whether to overwrite/save into tailscale state (default true).
+	// Set TS_OVERWRITE=false to attempt to apply flags without resetting stored prefs.
+	tsOverwrite := strBoolEnv("TS_OVERWRITE", true)
+
+	// New flag: whether to modify /etc/resolv.conf to prepend local nameservers.
+	// Defaults to false (opt-in). Set MODIFY_RESOLVCONF=true to enable.
+	modifyResolv := strBoolEnv("MODIFY_RESOLVCONF", false)
+
 	// Derive AdGuardHome paths under data dir (can be overridden)
 	aghWork := getenv("ADGUARDHOME_WORK_DIR", filepath.Join(dataDir, "adguard", "work"))
 	aghConf := getenv("ADGUARDHOME_CONF_DIR", filepath.Join(dataDir, "adguard", "conf"))
@@ -204,8 +210,15 @@ func main() {
 	ensureDir(aghWork, 0700)
 	ensureDir(aghConf, 0700)
 
-	if err := setupLocalDNS(); err != nil {
-		log.Printf("[warn] failed to setup local DNS: %v", err)
+	// Conditionally modify resolv.conf based on MODIFY_RESOLVCONF
+	if modifyResolv {
+		if err := setupLocalDNS(); err != nil {
+			log.Printf("[warn] failed to setup local DNS: %v", err)
+		} else {
+			log.Printf("[info] /etc/resolv.conf modified/updated (MODIFY_RESOLVCONF=true)")
+		}
+	} else {
+		log.Printf("[info] MODIFY_RESOLVCONF=false; skipping /etc/resolv.conf modification")
 	}
 
 	if tsDestIP != "" {
@@ -215,7 +228,7 @@ func main() {
 		log.Printf("[warn] TS_KUBE_SECRET is not implemented in this image. Mount a Kubernetes Secret to TS_STATE_DIR instead. Ignoring value: %q", tsKubeSecret)
 	}
 
-	// Start tailscaled (userspace networking handled here)
+	// 1) Start tailscaled (userspace networking handled here)
 	tsdArgs := []string{
 		"--state=" + filepath.Join(tsStateDir, "tailscaled.state"),
 		"--socket=" + tsSocket,
@@ -235,7 +248,7 @@ func main() {
 		log.Fatalf("tailscaled not ready: %v", err)
 	}
 
-	// Tailscale up (unless already logged in and TS_AUTH_ONCE)
+	// 2) tailscale up (unless already logged in and TS_AUTH_ONCE)
 	alreadyUp := func() bool {
 		cmd := exec.Command("/usr/bin/tailscale", "--socket="+tsSocket, "status", "--peers=false")
 		return cmd.Run() == nil
@@ -249,6 +262,15 @@ func main() {
 
 	if shouldUp {
 		upArgs := buildTailscaleUpArgs(tsSocket, tsAcceptDNS, tsAuthKey, tsHost, tsRoutes, tsSocks5, tsHTTPProxy)
+
+		// If we are authoritative, append --reset to ensure stored prefs are overwritten.
+		if tsOverwrite {
+			log.Printf("[info] TS_OVERWRITE=true: appending --reset to 'tailscale up' to enforce environment-configured settings")
+			upArgs = append(upArgs, "--reset")
+		} else {
+			log.Printf("[info] TS_OVERWRITE=false: trying 'tailscale up' without --reset (will fail if stored non-default flags conflict)")
+		}
+
 		// run tailscale up and capture stderr to detect the "mention all non-default flags" error
 		var stderr bytes.Buffer
 		cmd := exec.Command("/usr/bin/tailscale", upArgs...)
@@ -259,30 +281,17 @@ func main() {
 			stderrStr := stderr.String()
 			log.Printf("[error] tailscale up failed: %v", err)
 			// Detect the specific error from tailscale that asks to "mention all non-default flags"
-			if strings.Contains(stderrStr, "requires mentioning all non-default flags") {
-				// If TS_FORCE_RESET=true, retry with --reset (destructive: clears previously stored non-default flags)
-				if strBoolEnv("TS_FORCE_RESET", false) {
-					log.Printf("[info] tailscale up indicates non-default flags; retrying with --reset due to TS_FORCE_RESET=true")
-					upArgs = append(upArgs, "--reset")
-					cmd2 := exec.Command("/usr/bin/tailscale", upArgs...)
-					cmd2.Stdout = os.Stdout
-					cmd2.Stderr = os.Stderr
-					if err := cmd2.Run(); err != nil {
-						log.Printf("[error] tailscale up --reset failed: %v", err)
-					} else {
-						log.Printf("[info] tailscale up --reset succeeded")
-					}
-				} else {
-					// Log the stderr and a helpful hint showing which flags the entrypoint can supply
-					log.Printf("[error] tailscale up requires all non-default flags to be mentioned. stderr: %s", stderrStr)
-					log.Printf("[hint] Set environment variables so the entrypoint supplies commonly-used non-default flags:")
-					log.Printf("[hint] TS_ADVERTISE_EXIT_NODE=true  TS_ACCEPT_ROUTES=true  TS_FORCE_RESET=true (if you want an automatic reset)")
-				}
+			if strings.Contains(stderrStr, "requires mentioning all non-default flags") && !tsOverwrite {
+				log.Printf("[error] tailscale up failed due to stored non-default flags; consider setting TS_OVERWRITE=true to force overwriting stored prefs")
+				log.Printf("[error] stderr: %s", stderrStr)
+			} else {
+				// Log stderr for visibility; if we appended --reset it may still fail for other reasons (auth, key).
+				log.Printf("[error] tailscale up stderr: %s", stderrStr)
 			}
 		}
 	}
 
-	// Apply extra 'tailscale set' arguments, if provided
+	// 3) Apply extra 'tailscale set' arguments, if provided
 	if len(tsExtraArgs) > 0 {
 		args := append([]string{"--socket=" + tsSocket, "set"}, tsExtraArgs...)
 		cmd := exec.Command("/usr/bin/tailscale", args...)
@@ -294,14 +303,14 @@ func main() {
 		}
 	}
 
-	// After tailscale up and any set commands:
+	// after tailscale up and any set commands:
 	if err := waitForTailscaleIP(tsSocket, 10*time.Second); err != nil {
 		log.Printf("[warn] tailscale IP not found: %v — continuing, but DNS routing may fail", err)
 	} else {
 		log.Printf("[info] tailscale IP detected; starting AdGuard")
 	}
 
-	// Start AdGuardHome
+	// 4) Start AdGuardHome
 	aghArgs := []string{
 		"--no-check-update",
 		"--work-dir", aghWork,
@@ -312,11 +321,11 @@ func main() {
 		log.Fatalf("failed to start AdGuardHome: %v", err)
 	}
 
-	// Signal handling and wait
+	// 5) Signal handling and wait
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	// Graceful logout on first termination signal, removes ephemeral nodes immediately
+	// Add: graceful logout on first termination signal
 	loggedOut := make(chan struct{}, 1)
 	go func() {
 		sig := <-sigCh
