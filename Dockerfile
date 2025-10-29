@@ -4,8 +4,8 @@
 FROM golang:1.23-bookworm AS entrypoint-builder
 WORKDIR /src
 RUN mkdir -p /out
-COPY entrypoint/ ./entrypoint/
-RUN CGO_ENABLED=0 GOFLAGS="-trimpath" go build -ldflags="-s -w" -o /out/entrypoint ./entrypoint
+COPY entrypoint/main.go ./main.go
+RUN CGO_ENABLED=0 GOFLAGS="-trimpath" go build -ldflags="-s -w" -o /out/entrypoint ./main.go
 
 #############################
 # 2) Get latest Tailscale   #
