@@ -3,9 +3,12 @@
 ############################
 FROM golang:1.23-bookworm AS entrypoint-builder
 WORKDIR /src
-RUN mkdir -p /out
-COPY entrypoint/main.go ./main.go
-RUN CGO_ENABLED=0 GOFLAGS="-trimpath" go build -ldflags="-s -w" -o /out/entrypoint ./main.go
+COPY go.mod go.sum ./
+RUN go mod download
+COPY entrypoint/ ./entrypoint/
+RUN mkdir -p /out \
+    && CGO_ENABLED=0 GOFLAGS="-trimpath" \
+       go build -ldflags="-s -w" -o /out/entrypoint ./entrypoint
 
 #############################
 # 2) Get latest Tailscale   #
