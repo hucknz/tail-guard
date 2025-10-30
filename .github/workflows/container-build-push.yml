@@ -41,22 +41,40 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Find latest semver tag vMAJOR.MINOR.PATCH (sorted by semver)
+          # Input tag string source: fetch latest semver tag in repo (vMAJOR.MINOR.PATCH)
           latest_tag=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
 
-          if [ -z "$latest_tag" ]; then
-            major=0
-            minor=0
-            patch=0
-          else
+          # Default numeric parts
+          major=0
+          minor=0
+          patch=0
+
+          if [ -n "$latest_tag" ]; then
+            # strip leading v if present
             ver="${latest_tag#v}"
-            IFS='.' read -r major minor patch <<< "$ver"
-            major=${major:-0}
-            minor=${minor:-0}
-            patch=${patch:-0}
+            # try to extract three numeric components; be robust against unexpected formats
+            if echo "$ver" | grep -qE '^([0-9]+)\.([0-9]+)\.([0-9]+)$'; then
+              IFS='.' read -r major minor patch <<< "$ver"
+            else
+              # fallback: extract first numeric triple found inside the tag string
+              extracted=$(echo "$ver" | grep -oE '([0-9]+)\.([0-9]+)\.([0-9]+)' | head -n1 || true)
+              if [ -n "$extracted" ]; then
+                IFS='.' read -r major minor patch <<< "$extracted"
+              else
+                major=0; minor=0; patch=0
+              fi
+            fi
           fi
 
+          # ensure numeric (strip non-digits, fallback to 0)
+          re_digits='^[0-9]+$'
+          if ! echo "$major" | grep -qE "$re_digits"; then major=0; fi
+          if ! echo "$minor" | grep -qE "$re_digits"; then minor=0; fi
+          if ! echo "$patch" | grep -qE "$re_digits"; then patch=0; fi
+
+          # bump patch safely
           new_patch=$((patch + 1))
+
           repo_tag="v${major}.${minor}.${new_patch}"
           composite_tag="${repo_tag}-agh${ADGUARD_VERSION}-ts${TAILSCALE_VERSION}"
 
@@ -64,7 +82,7 @@ jobs:
           echo "REPO_TAG=${repo_tag}" >> "$GITHUB_ENV"
           echo "COMPOSITE_TAG=${composite_tag}" >> "$GITHUB_ENV"
 
-          # also expose as step outputs
+          # expose as step outputs
           echo "repo_tag=${repo_tag}" >> "$GITHUB_OUTPUT"
           echo "composite_tag=${composite_tag}" >> "$GITHUB_OUTPUT"
 
