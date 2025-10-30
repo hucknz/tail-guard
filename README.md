@@ -1,5 +1,5 @@
 # tail-guard
-Tailscale meets Adguard in a tiny Docker container. 
+Tailscale® meets Adguard in a tiny Docker container. 
 
 # Purpose
 I wanted a simple and lightweight way to deploy Tailscale exit nodes & Adguard ad blocking to low powered (1 shared CPU, 265mb memory) VPS's around the world. I have these running on the fly.io legacy free tier but they should work anywhere containers are run. 
