@@ -4,9 +4,6 @@ name: Build & push new tail-guard container
 # and then creates/pushes corresponding git tags (repo semver and composite).
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - '.version'
 
 jobs:
   build_and_push:
