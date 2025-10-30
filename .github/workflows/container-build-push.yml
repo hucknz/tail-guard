@@ -1,4 +1,4 @@
-name: tail-guard build and push
+name: Build & push new tail-guard container
 
 # Builds and pushes images, includes a semver tag for the container (patch bump),
 # and then creates/pushes corresponding git tags (repo semver and composite).
