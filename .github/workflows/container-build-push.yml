@@ -1,8 +1,7 @@
 name: tail-guard build and push
 
-# This workflow is triggered by an update to the upstream-releases file (which is triggered by the check-releases workflow).
-# When triggered the latest version of the container is built and pushed to docker hub
-
+# Builds and pushes images, includes a semver tag for the container (patch bump),
+# and then creates/pushes corresponding git tags (repo semver and composite).
 on:
   workflow_dispatch:
 
@@ -12,13 +11,63 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       packages: write
-      contents: read
+      contents: write
     steps:
 
-      - name: Check out the repo
-        id: checkout_repository
+      - name: Check out the repo (with full history & tags)
         uses: actions/checkout@v4
-        
+        with:
+          fetch-depth: 0
+
+      - name: Get latest Adguard version number
+        id: get_adguard_version
+        run: |
+          ADGUARD_VERSION=$(grep "^adguard_version=" .version | cut -d'=' -f2)
+          echo "ADGUARD_VERSION=$ADGUARD_VERSION" >> $GITHUB_ENV
+
+      - name: Get latest Tailscale version number
+        id: get_tailscale_version
+        run: |
+          TAILSCALE_VERSION=$(grep "^tailscale_version=" .version | cut -d'=' -f2)
+          echo "TAILSCALE_VERSION=$TAILSCALE_VERSION" >> $GITHUB_ENV
+
+      - name: Ensure tags & full history are present
+        run: |
+          # make sure we have tags and full history for semantic tag calculation
+          git fetch --prune --unshallow --tags || git fetch --tags || true
+
+      - name: Compute repo semver tag (patch bump) and composite tag
+        id: compute_tags
+        run: |
+          set -euo pipefail
+
+          # Find latest semver tag vMAJOR.MINOR.PATCH (sorted by semver)
+          latest_tag=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
+
+          if [ -z "$latest_tag" ]; then
+            major=0
+            minor=0
+            patch=0
+          else
+            ver="${latest_tag#v}"
+            IFS='.' read -r major minor patch <<< "$ver"
+            major=${major:-0}
+            minor=${minor:-0}
+            patch=${patch:-0}
+          fi
+
+          new_patch=$((patch + 1))
+          repo_tag="v${major}.${minor}.${new_patch}"
+          composite_tag="${repo_tag}-agh${ADGUARD_VERSION}-ts${TAILSCALE_VERSION}"
+
+          echo "LATEST_SEMVER_TAG=${latest_tag:-}" >> "$GITHUB_ENV"
+          echo "REPO_TAG=${repo_tag}" >> "$GITHUB_ENV"
+          echo "COMPOSITE_TAG=${composite_tag}" >> "$GITHUB_ENV"
+
+          # also expose as step outputs
+          echo "repo_tag=${repo_tag}" >> "$GITHUB_OUTPUT"
+          echo "composite_tag=${composite_tag}" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU
         id: setup_qemu
         uses: docker/setup-qemu-action@v3
@@ -26,6 +75,13 @@ jobs:
       - name: Set up Docker Buildx
         id: setup_buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        id: authenticate_dockerhub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Authenticate to ghcr.io
         id: authenticate_ghcr
@@ -35,16 +91,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
+      - name: Extract metadata (tags, labels) for Docker (including semver)
         id: extract_metadata
         uses: docker/metadata-action@v5
         with:
           images: |
+            hucknz/tail-guard
             ghcr.io/${{ github.repository }}
           tags: |
+            type=raw,value=agh-${{ env.ADGUARD_VERSION }}
+            type=raw,value=ts-${{ env.TAILSCALE_VERSION }}
             type=raw,value=latest
+            type=raw,value=${{ env.REPO_TAG }}
+            type=raw,value=${{ env.COMPOSITE_TAG }}
 
-      - name: Build and push Docker images
+      - name: Build and push Docker images (with semver tag)
         id: build_images
         uses: docker/build-push-action@v5
         with:
@@ -52,6 +113,43 @@ jobs:
           push: true
           tags: ${{ steps.extract_metadata.outputs.tags }}
           labels: ${{ steps.extract_metadata.outputs.labels }}
+
+      - name: Create and push git tags (repo semver + composite)
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Use the tags computed earlier
+          repo_tag="${{ env.REPO_TAG }}"
+          composite_tag="${{ env.COMPOSITE_TAG }}"
+          ADGUARD_VERSION="${{ env.ADGUARD_VERSION }}"
+          TAILSCALE_VERSION="${{ env.TAILSCALE_VERSION }}"
+
+          echo "Preparing to push git tags: ${repo_tag}, ${composite_tag}"
+
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+
+          # create annotated tags if they don't already exist
+          if git rev-parse -q --verify "refs/tags/${repo_tag}" >/dev/null; then
+            echo "Repo semver tag ${repo_tag} already exists; skipping creation"
+          else
+            git tag -a "${repo_tag}" -m "Release ${repo_tag} — AdGuard: ${ADGUARD_VERSION}, Tailscale: ${TAILSCALE_VERSION}"
+            echo "Created tag ${repo_tag}"
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${composite_tag}" >/dev/null; then
+            echo "Composite tag ${composite_tag} already exists; skipping creation"
+          else
+            git tag -a "${composite_tag}" -m "Release ${composite_tag} — AdGuard: ${ADGUARD_VERSION}, Tailscale: ${TAILSCALE_VERSION}"
+            echo "Created tag ${composite_tag}"
+          fi
+
+          # push tags (tolerate failures if concurrent job already pushed)
+          git push origin "${repo_tag}" || echo "Failed to push ${repo_tag} (maybe already pushed)"
+          git push origin "${composite_tag}" || echo "Failed to push ${composite_tag} (maybe already pushed)"
 
       - name: Notify outcome
         id: notify

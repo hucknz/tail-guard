@@ -1,0 +1,118 @@
+name: Check for new AdGuardHome & Tailscale releases
+
+# This script runs on a schedule to check for new releases from the upstream repo. If it finds a new release writes the latest release number to a file. 
+# Credit to peterevans on stackoverflow for the script: https://stackoverflow.com/a/58468828
+
+on:
+  schedule:
+    - cron:  '21 19 * * *'
+
+  workflow_dispatch:
+
+jobs:
+  get-version:
+    runs-on: ubuntu-latest
+    steps:
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+  
+      - name: Get current version numbers
+        id: get_current_versions
+        run: |
+          echo "LATEST_ADGUARD_VERSION=$(curl -s https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest | jq -r '.tag_name' | sed 's/release-//' | sed 's/_v.*//')" >> "${GITHUB_ENV}"
+          echo "LATEST_TAILSCALE_VERSION=$(curl -s https://api.github.com/repos/tailscale/tailscale/releases/latest | jq -r '.tag_name' | sed 's/release-//' | sed 's/_v.*//')" >> "${GITHUB_ENV}"
+          echo "LATEST_TAILGUARD_TAG=$(git describe --abbrev=0 --tags `git rev-list --tags --max-count=1` | sed 's/v//')" >> "${GITHUB_ENV}"
+
+      - name: Get previous version numbers
+        id: get_previous_version
+        run: |
+          echo "PREVIOUS_ADGUARD_VERSION=$(grep "adguard_version" .version | cut -d'=' -f2)" >> "${GITHUB_ENV}"
+          echo "PREVIOUS_TAILSCALE_VERSION=$(grep "tailscale_version" .version | cut -d'=' -f2)" >> "${GITHUB_ENV}"
+
+      - name: Compare versions and update .version
+        id: compare_versions
+        run: |
+          set -euo pipefail
+
+          modified=false
+
+          # Helper to update or append a key in .version
+          update_or_append() {
+            key="$1"     # e.g. adguard_version
+            new="$2"     # new version string
+            if [ -z "$new" ] || [ "$new" = "null" ]; then
+              echo "No valid new value for $key. Skipping."
+              return 1
+            fi
+
+            prev=""
+            # read previous value from .version if present
+            if grep -qE "^${key}=" .version 2>/dev/null; then
+              prev="$(grep -E "^${key}=" .version | head -n1 | cut -d'=' -f2-)"
+            fi
+
+            if [ -n "$prev" ]; then
+              if [ "$prev" = "$new" ]; then
+                echo "$key unchanged ($new)."
+                return 1
+              else
+                echo "$key changed: $prev -> $new. Updating .version"
+                # replace the line
+                sed -i "s/^${key}=.*/${key}=${new}/" .version
+                return 0
+              fi
+            else
+              echo "$key not present in .version. Appending ${key}=${new}"
+              printf "%s=%s\n" "$key" "$new" >> .version
+              return 0
+            fi
+          }
+
+          # Compare/update AdGuard
+          if update_or_append "adguard_version" "${LATEST_ADGUARD_VERSION:-}"; then
+            modified=true
+          fi
+
+          # Compare/update Tailscale
+          if update_or_append "tailscale_version" "${LATEST_TAILSCALE_VERSION:-}"; then
+            modified=true
+          fi
+
+          if [ "$modified" = "true" ]; then
+            echo "MODIFIED=true" >> "$GITHUB_ENV"
+            echo "One or more versions updated."
+          else
+            echo "MODIFIED=false" >> "$GITHUB_ENV"
+            echo "No changes to versions."
+          fi
+
+      - name: Commit latest version
+        if: env.MODIFIED == 'true'
+        run: |
+          git config --global user.name 'hucknz'
+          git config --global user.email '12265772+hucknz@users.noreply.github.com'
+          git commit -am "New version found"
+          git push
+  
+      - name: Notify new version found
+        id: notify_current_version
+        if: env.MODIFIED == 'true'
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          noprefix: true
+          status: ${{ job.status }}
+          title: ${{ github.workflow}} ${{ job.status }}
+          description: "A new upstream version was found. The build and push workflow has been triggered."
+      
+      - name: Notify failure
+        id: notify_failure
+        if: failure()
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          noprefix: true
+          status: ${{ job.status }}
+          title: "Tail-guard release check ${{ job.status }}"
